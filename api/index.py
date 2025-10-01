@@ -1,18 +1,12 @@
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
-import instaloader
-import re
 import requests
+import re
+import os
 
 app = Flask(__name__, template_folder='../templates', static_folder='../static')
 
-# Initialize Instaloader
-L = instaloader.Instaloader(
-    download_videos=True,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False
-)
+# Get RapidAPI Key from environment variable (you set this on Vercel)
+RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '')
 
 
 def extract_shortcode(url):
@@ -30,15 +24,51 @@ def extract_shortcode(url):
     return None
 
 
+def get_video_from_rapidapi(url):
+    """Get video URL using RapidAPI"""
+    try:
+        api_url = "https://instagram-scraper-api2.p.rapidapi.com/v1/post_info"
+
+        querystring = {"code_or_id_or_url": url}
+
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": "instagram-scraper-api2.p.rapidapi.com"
+        }
+
+        response = requests.get(api_url, headers=headers, params=querystring, timeout=15)
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get('data'):
+            post_data = data['data']
+
+            # Get video URL
+            video_url = post_data.get('video_url')
+
+            if video_url:
+                return {
+                    'video_url': video_url,
+                    'username': post_data.get('owner', {}).get('username', 'Unknown'),
+                    'caption': post_data.get('caption', {}).get('text', '')[:200],
+                    'likes': post_data.get('like_count', 0)
+                }
+
+        return None
+
+    except Exception as e:
+        print(f"RapidAPI Error: {e}")
+        return None
+
+
 @app.route('/')
 def index():
-    """Render the main page"""
     return render_template('index.html')
 
 
 @app.route('/api/download', methods=['POST'])
 def download_reel():
-    """Handle reel download requests"""
     try:
         data = request.get_json()
         url = data.get('url', '').strip()
@@ -46,35 +76,25 @@ def download_reel():
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
-        # Extract shortcode
         shortcode = extract_shortcode(url)
         if not shortcode:
             return jsonify({'error': 'Invalid Instagram URL'}), 400
 
-        try:
-            # Get post data
-            post = instaloader.Post.from_shortcode(L.context, shortcode)
+        result = get_video_from_rapidapi(url)
 
-            # Check if it's a video
-            if not post.is_video:
-                return jsonify({'error': 'This post is not a video'}), 400
+        if not result or not result.get('video_url'):
+            return jsonify({'error': 'Could not download video. Make sure the post is public.'}), 400
 
-            # Get video URL directly
-            video_url = post.video_url
-
-            return jsonify({
-                'success': True,
-                'message': 'Reel information retrieved successfully',
-                'video_url': video_url,
-                'caption': post.caption[:200] if post.caption else 'No caption',
-                'likes': post.likes,
-                'owner': post.owner_username,
-                'shortcode': shortcode,
-                'date': post.date.isoformat()
-            })
-
-        except instaloader.exceptions.InstaloaderException as e:
-            return jsonify({'error': f'Instagram error: {str(e)}'}), 500
+        return jsonify({
+            'success': True,
+            'message': 'Reel downloaded successfully',
+            'video_url': result['video_url'],
+            'caption': result.get('caption', ''),
+            'likes': result.get('likes', 0),
+            'owner': result.get('username', 'Unknown'),
+            'shortcode': shortcode,
+            'date': ''
+        })
 
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
@@ -82,36 +102,28 @@ def download_reel():
 
 @app.route('/api/download-video/<shortcode>')
 def download_video_file(shortcode):
-    """Proxy download endpoint - forces video download"""
     try:
-        # Get post data
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        instagram_url = f"https://www.instagram.com/reel/{shortcode}/"
+        result = get_video_from_rapidapi(instagram_url)
 
-        if not post.is_video:
-            return jsonify({'error': 'Not a video'}), 400
+        if not result or not result.get('video_url'):
+            return jsonify({'error': 'Could not download video'}), 400
 
-        # Get video URL
-        video_url = post.video_url
+        video_url = result['video_url']
 
-        # Fetch video from Instagram with streaming and optimized settings
-        response = requests.get(
-            video_url,
-            stream=True,
-            timeout=30,  # Add timeout
-            headers={'User-Agent': 'Mozilla/5.0'}  # Add user agent
-        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(video_url, stream=True, headers=headers, timeout=30)
         response.raise_for_status()
 
-        # Generate filename
         filename = f"instagram_reel_{shortcode}.mp4"
 
-        # Create a Flask response that streams the video with larger chunks
         def generate():
-            for chunk in response.iter_content(chunk_size=65536):  # Increased from 8192 to 65536 (64KB)
+            for chunk in response.iter_content(chunk_size=65536):
                 if chunk:
                     yield chunk
 
-        # Return as downloadable file
         return Response(
             stream_with_context(generate()),
             content_type='video/mp4',
@@ -125,9 +137,9 @@ def download_video_file(shortcode):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/api/info', methods=['POST'])
 def get_reel_info():
-    """Get reel information without downloading"""
     try:
         data = request.get_json()
         url = data.get('url', '').strip()
@@ -135,28 +147,26 @@ def get_reel_info():
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
-        shortcode = extract_shortcode(url)
-        if not shortcode:
-            return jsonify({'error': 'Invalid Instagram URL'}), 400
+        result = get_video_from_rapidapi(url)
 
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        if not result:
+            return jsonify({'error': 'Could not fetch video info'}), 400
 
         return jsonify({
             'success': True,
-            'is_video': post.is_video,
-            'caption': post.caption[:200] if post.caption else 'No caption',
-            'likes': post.likes,
-            'comments': post.comments,
-            'date': post.date.isoformat(),
-            'owner_username': post.owner_username,
-            'video_url': post.video_url if post.is_video else None,
-            'video_duration': post.video_duration if post.is_video else None
+            'is_video': True,
+            'caption': result.get('caption', ''),
+            'likes': result.get('likes', 0),
+            'comments': 0,
+            'date': '',
+            'owner_username': result.get('username', 'Unknown'),
+            'video_url': result['video_url'],
+            'video_duration': None
         })
 
     except Exception as e:
-        return jsonify({'error': f'Error fetching info: {str(e)}'}), 500
+        return jsonify({'error': f'Error: {str(e)}'}), 500
 
 
-# For local development
 if __name__ == '__main__':
     app.run(debug=True)
