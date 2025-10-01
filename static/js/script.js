@@ -48,34 +48,53 @@ async function downloadReel() {
     }
 }
 
-// NEW: Function to handle download with progress feedback
+// NEW: Detect if user is on mobile
+function isMobile() {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
+
+// NEW: Download function for mobile using server proxy
 async function initiateDownload(shortcode) {
-    // Show downloading indicator
     const downloadBtn = event.target;
     const originalText = downloadBtn.innerHTML;
-    downloadBtn.innerHTML = '⏳ Preparing Download...';
+
+    // Show downloading indicator
+    downloadBtn.innerHTML = '⏳ Preparing...';
     downloadBtn.classList.add('opacity-75', 'cursor-wait');
     downloadBtn.style.pointerEvents = 'none';
 
-    // Create a hidden link and trigger download
-    const downloadUrl = `/api/download-video/${shortcode}`;
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = `instagram_reel_${shortcode}.mp4`;
-    document.body.appendChild(link);
-    link.click();
+    if (isMobile()) {
+        // For mobile: Use server proxy download
+        const downloadUrl = `/api/download-video/${shortcode}`;
+        window.location.href = downloadUrl;
 
-    // Reset button after a short delay
-    setTimeout(() => {
-        downloadBtn.innerHTML = '✅ Download Started!';
         setTimeout(() => {
-            downloadBtn.innerHTML = originalText;
-            downloadBtn.classList.remove('opacity-75', 'cursor-wait');
-            downloadBtn.style.pointerEvents = 'auto';
-        }, 2000);
-    }, 1000);
+            downloadBtn.innerHTML = '✅ Check Downloads!';
+            setTimeout(() => {
+                downloadBtn.innerHTML = originalText;
+                downloadBtn.classList.remove('opacity-75', 'cursor-wait');
+                downloadBtn.style.pointerEvents = 'auto';
+            }, 3000);
+        }, 1000);
+    } else {
+        // For desktop: Use anchor tag
+        const downloadUrl = `/api/download-video/${shortcode}`;
+        const link = document.createElement('a');
+        link.href = downloadUrl;
+        link.download = `instagram_reel_${shortcode}.mp4`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
 
-    document.body.removeChild(link);
+        setTimeout(() => {
+            downloadBtn.innerHTML = '✅ Download Started!';
+            setTimeout(() => {
+                downloadBtn.innerHTML = originalText;
+                downloadBtn.classList.remove('opacity-75', 'cursor-wait');
+                downloadBtn.style.pointerEvents = 'auto';
+            }, 2000);
+        }, 1000);
+    }
 }
 
 function displayReelInfo(data) {
@@ -104,6 +123,9 @@ function displayReelInfo(data) {
 
 function displayDownloadResult(data) {
     const resultContent = document.getElementById('resultContent');
+    const mobileInstructions = isMobile() ?
+        '<p class="mt-3 text-sm text-gray-600 text-center">📱 Mobile: Video will open in new tab. Long-press to save!</p>' :
+        '<p class="mt-3 text-sm text-gray-600 text-center">💡 Download may take a few seconds</p>';
 
     resultContent.innerHTML = `
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -122,9 +144,7 @@ function displayDownloadResult(data) {
                 ▶️ Play Video
             </a>
         </div>
-        <p class="mt-3 text-sm text-gray-600 text-center">
-            💡 Tip: Download may take a few seconds depending on video size
-        </p>
+        ${mobileInstructions}
     `;
 
     showResult();
