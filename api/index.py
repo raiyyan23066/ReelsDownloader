@@ -1,17 +1,16 @@
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context, send_file
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template
 import yt_dlp
 import re
 import os
-import tempfile
-import json
-import requests  # <-- ADDED: For streaming the direct video URL
-import shutil
-from werkzeug.utils import secure_filename
+import requests  # Crucial for streaming the direct video URL
 from flask_cors import CORS
+import time  # <-- ADDED: For retry logic delays
 
 # --- CONFIGURATION ---
-# IMPORTANT: When deploying, set FLASK_ENV=production and use a proper WSGI server (Gunicorn)
-app = Flask(__name__, template_folder='../templates', static_folder='../static')
+# FIX: The template folder path is adjusted to find 'templates' outside the 'api' directory.
+# We use os.path.dirname and os.path.abspath to ensure the path is correctly resolved.
+template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
+app = Flask(__name__, template_folder=template_dir)
 CORS(app, resources={
     r"/*": {
         "origins": "*",
@@ -47,24 +46,18 @@ def extract_shortcode(url):
 
 def get_video_info_ytdlp(url):
     """
-    Get video info using yt-dlp to find the direct stream URL.
+    Core function to get video info using yt-dlp to find the direct stream URL.
+    Returns info dict or None on fatal failure.
     """
     try:
-        print(f"\n{'=' * 70}")
-        print(f"Fetching: {url}")
-        print(f"{'=' * 70}")
-
         clean_url = url.split('?')[0]
 
         ydl_opts = {
-            'quiet': True,  # Keep quiet for production logs
+            'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-            'format': 'best[ext=mp4]/best',  # Prefer mp4 for mobile
+            'format': 'best[ext=mp4]/best',
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1',
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15',
-            }
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -76,48 +69,59 @@ def get_video_info_ytdlp(url):
             video_url = None
             formats = info.get('formats', [])
 
-            # Find best MP4 format
             for fmt in reversed(formats):
                 if fmt.get('ext') == 'mp4' and fmt.get('url'):
                     video_url = fmt['url']
                     break
 
-            # Fallback
             if not video_url:
                 video_url = info.get('url')
 
             if not video_url:
-                print("✗ No video URL found")
                 return None
-
-            print(f"✓ Video info extracted successfully")
 
             return {
                 'video_url': video_url,
                 'username': info.get('uploader', 'Unknown'),
-                'caption': info.get('description', '')[:200] or info.get('title', ''),
-                'thumbnail': info.get('thumbnail', ''),
-                'duration': info.get('duration', 0),
                 'title': info.get('title', 'Instagram Video'),
-                'ext': info.get('ext', 'mp4')
+                'duration': info.get('duration', 0),
             }
 
-    except yt_dlp.utils.DownloadError as e:
-        print(f"✗ yt-dlp Error: {str(e)}")
-        return None
     except Exception as e:
-        print(f"✗ Unexpected Error: {str(e)}")
-        return None
+        # We catch the exception here and let the retries handle it higher up
+        raise e
+
+
+def get_video_info_with_retries(url, max_retries=3):
+    """
+    Attempts to get video info, retrying on failure due to temporary network or API issues.
+    """
+    for attempt in range(max_retries):
+        try:
+            result = get_video_info_ytdlp(url)
+            if result and result.get('video_url'):
+                print(f"✓ Info fetch succeeded on attempt {attempt + 1}")
+                return result
+        except Exception as e:
+            print(f"✗ Info fetch failed on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                # Wait before the next retry (exponential backoff not needed, simple wait is fine)
+                time.sleep(2 * (attempt + 1))
+            else:
+                # Last attempt failed
+                print("✗ All info fetch attempts failed.")
+                return None
 
 
 @app.route('/')
 def index():
+    # Renders the client-side HTML/JS
     return render_template('index.html')
 
 
 @app.route('/api/info', methods=['POST', 'OPTIONS'])
 def get_reel_info():
-    """Get video info without downloading - used for initial fetch"""
+    """API endpoint to get video info (used by the 'Get Info' button)"""
     if request.method == 'OPTIONS':
         return '', 204
 
@@ -128,21 +132,21 @@ def get_reel_info():
         if not url or 'instagram.com' not in url:
             return jsonify({'error': 'Please provide a valid Instagram URL'}), 400
 
-        result = get_video_info_ytdlp(url)
+        shortcode = extract_shortcode(url)
+        if not shortcode:
+            return jsonify({'error': 'Invalid Instagram URL format'}), 400
+
+        # ⭐ USE THE RETRY FUNCTION HERE
+        result = get_video_info_with_retries(url)
 
         if not result:
-            return jsonify({'error': 'Could not fetch video info. Possible private post or rate limit.'}), 400
-
-        # NOTE: The client should now use the 'shortcode' to call the /api/stream-video route.
-        shortcode = extract_shortcode(url)
+            return jsonify(
+                {'error': 'Could not fetch video info after retries. Video may be private or unavailable.'}), 400
 
         return jsonify({
             'success': True,
-            'message': '✓ Video fetched successfully',
-            'video_url': result['video_url'],  # This is a short-lived URL
             'owner_username': result.get('username', 'Unknown'),
             'shortcode': shortcode,
-            'thumbnail': result.get('thumbnail', ''),
             'video_duration': result.get('duration', None),
             'title': result.get('title', 'Instagram Video')
         })
@@ -155,65 +159,53 @@ def get_reel_info():
 @app.route('/api/stream-video/<shortcode>', methods=['GET'])
 def stream_video_file(shortcode):
     """
-    🚀 FIXED: Streams the video file directly from the source URL.
-    This prevents server/browser timeouts (pending -> fails) on mobile devices
-    by immediately sending data chunks to the client.
+    FIXED ROUTE: Streams video directly from source URL.
+    This prevents mobile client timeouts (pending -> fails).
     """
     instagram_url = f"https://www.instagram.com/reel/{shortcode}/"
     filename = f"instagram_reel_{shortcode}.mp4"
 
     try:
-        # 1. Get the direct, temporary video URL using yt-dlp
-        info = get_video_info_ytdlp(instagram_url)
+        # 1. Get the direct, temporary video URL (⭐ USING RETRIES HERE TOO)
+        info = get_video_info_with_retries(instagram_url)
         if not info or not info.get('video_url'):
-            return jsonify({'error': 'Could not find video URL to stream.'}), 404
+            # This returns the small JSON file that causes the tiny failed download
+            print(f"✗ Failed to get video URL for streaming after all retries for {shortcode}.")
+            return jsonify({'error': 'Failed to get video stream URL from Instagram (retried 3 times).'}), 404
 
         direct_video_url = info['video_url']
 
-        # 2. Start a streaming request to the direct video URL
-        # We pass the client's Range header to the source for proper streaming/resuming.
+        # 2. Prepare request headers, crucially passing the client's Range header
         headers = {
             'User-Agent': request.headers.get('User-Agent',
                                               'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15'),
-            'Range': request.headers.get('Range', '')  # Crucial for mobile Range requests
+            'Range': request.headers.get('Range', '')
         }
 
-        # Set a reasonable timeout for the total stream connection
+        # 3. Start a streaming request to the direct video URL
         r = requests.get(direct_video_url, headers=headers, stream=True, timeout=300)
 
-        # Check for 200 (full content) or 206 (partial content)
         if r.status_code not in (200, 206):
             print(f"✗ Failed to get direct video stream. Status: {r.status_code}")
             return jsonify({'error': f'Failed to stream video from source. Status: {r.status_code}'}), 500
 
-        # 3. Generator to yield chunks of the stream
+        # 4. Generator to yield chunks
         def generate_stream():
             try:
-                # Use iter_content to read data in chunks
                 for chunk in r.iter_content(chunk_size=8192):
                     yield chunk
-            except Exception as e:
-                # Log streaming error but let the stream close
-                print(f"Streaming inner error: {e}")
             finally:
-                # Ensure connection is closed
                 r.close()
 
-        # 4. Construct the Final Response
+        # 5. Construct the final streaming Response
         response_headers = {
-            # Forces the browser to download
             'Content-Disposition': f'attachment; filename="{filename}"',
-            # Pass through critical streaming headers from the video source
             'Accept-Ranges': r.headers.get('Accept-Ranges', 'bytes'),
             'Content-Length': r.headers.get('Content-Length'),
-            'Content-Range': r.headers.get('Content-Range'),  # Only present for 206 status
-            # Important caching headers for mobile
+            'Content-Range': r.headers.get('Content-Range'),
             'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0',
         }
 
-        # Use the status code from the source (200 or 206)
         response = Response(
             stream_with_context(generate_stream()),
             status=r.status_code,
@@ -225,81 +217,13 @@ def stream_video_file(shortcode):
 
     except Exception as e:
         print(f"✗ Streaming Error: {str(e)}")
-        # This occurs if requests.get() fails (e.g., DNS, initial timeout)
         return jsonify({'error': f'Download/Streaming failed: {str(e)}'}), 500
-
-
-# --- Removed the OLD, BLOCKING download_video_file route ---
-# It was removed because the blocking I/O caused the mobile timeout issue.
-# The new route is: /api/stream-video/<shortcode>
-
-
-# --- HEALTH AND TEST ROUTES (Kept for completeness) ---
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    try:
-        import yt_dlp
-        version = yt_dlp.version.__version__
-        return jsonify({
-            'status': '✓ healthy',
-            'method': 'yt-dlp (FREE)',
-            'yt_dlp_version': version,
-            'mobile_optimized': True,
-            'supports_range_requests': True
-        })
-    except Exception as e:
-        return jsonify({
-            'status': '✗ error',
-            'error': str(e)
-        }), 500
-
-
-@app.route('/test', methods=['GET'])
-def test_download():
-    """Test with a sample URL"""
-    try:
-        test_url = "https://www.instagram.com/reel/DPB75Z9DGjb/"  # Sample reel
-
-        print(f"\n{'=' * 70}")
-        print(f"🧪 TESTING")
-        print(f"{'=' * 70}")
-
-        result = get_video_info_ytdlp(test_url)
-
-        if result:
-            return jsonify({
-                'status': '✓ SUCCESS',
-                'message': 'yt-dlp is working and retrieved a direct URL for streaming.',
-                'test_url': test_url,
-                'video_found': True,
-                'video_info': {
-                    'title': result.get('title', ''),
-                    'duration': result.get('duration', 0),
-                    'has_video_url': bool(result.get('video_url'))
-                },
-                'mobile_compatible': True
-            })
-        else:
-            return jsonify({
-                'status': '✗ FAILED',
-                'message': 'Could not fetch video info for test URL (it might be private or deleted).',
-            }), 400
-
-    except Exception as e:
-        return jsonify({
-            'status': '✗ ERROR',
-            'error': str(e),
-        }), 500
 
 
 if __name__ == '__main__':
     print(f"\n{'=' * 70}")
     print(f"🚀 Flask Instagram Downloader - FIXED & STREAMING")
-    print(f"{'=' * 70}")
-    print(f"✓ Fixed mobile 'pending' issue by switching to **direct streaming**.")
-    print(f"✓ New stream endpoint: /api/stream-video/<shortcode>")
-    print(f"✓ Health check: http://localhost:5000/health\n")
-
+    print(f"✓ Streaming route: /api/stream-video/<shortcode>")
+    print(f"{'=' * 70}\n")
+    # In a production environment, use gunicorn: gunicorn -w 4 app:app
     app.run(debug=True, host='0.0.0.0', port=5000)
