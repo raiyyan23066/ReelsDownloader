@@ -6,9 +6,20 @@ import requests  # Crucial for streaming the direct video URL
 from flask_cors import CORS
 import time  # <-- ADDED: For retry logic delays
 
-# --- CONFIGURATION ---
+# --- PROXY CONFIGURATION ---
+# Read proxy URL from environment variable (e.g., set INSTAGRAM_PROXY=http://user:pass@host:port)
+PROXY_URL = os.environ.get('INSTAGRAM_PROXY')
+PROXY_CONFIG = {}
+if PROXY_URL:
+    PROXY_CONFIG = {
+        'http': PROXY_URL,
+        'https': PROXY_URL,
+    }
+    print(f"✓ Proxy configured: Using {PROXY_URL}")
+# ---------------------------
+
+# --- FLASK CONFIGURATION ---
 # FIX: The template folder path is adjusted to find 'templates' outside the 'api' directory.
-# We use os.path.dirname and os.path.abspath to ensure the path is correctly resolved.
 template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
 app = Flask(__name__, template_folder=template_dir)
 CORS(app, resources={
@@ -59,6 +70,10 @@ def get_video_info_ytdlp(url):
             'format': 'best[ext=mp4]/best',
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1',
         }
+
+        # Apply proxy to yt-dlp options if configured
+        if PROXY_URL:
+            ydl_opts['proxy'] = PROXY_URL
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(clean_url, download=False)
@@ -182,8 +197,8 @@ def stream_video_file(shortcode):
             'Range': request.headers.get('Range', '')
         }
 
-        # 3. Start a streaming request to the direct video URL
-        r = requests.get(direct_video_url, headers=headers, stream=True, timeout=300)
+        # 3. Start a streaming request to the direct video URL, using proxy if configured
+        r = requests.get(direct_video_url, headers=headers, stream=True, timeout=300, proxies=PROXY_CONFIG)
 
         if r.status_code not in (200, 206):
             print(f"✗ Failed to get direct video stream. Status: {r.status_code}")
