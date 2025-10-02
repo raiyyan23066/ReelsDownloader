@@ -4,26 +4,29 @@ import re
 import os
 import tempfile
 import json
+import requests  # <-- ADDED: For streaming the direct video URL
+import shutil
 from werkzeug.utils import secure_filename
-
-app = Flask(__name__, template_folder='../templates', static_folder='../static')
-
 from flask_cors import CORS
 
-# Enable CORS for mobile browsers
+# --- CONFIGURATION ---
+# IMPORTANT: When deploying, set FLASK_ENV=production and use a proper WSGI server (Gunicorn)
+app = Flask(__name__, template_folder='../templates', static_folder='../static')
 CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization", "Range"],
-        "expose_headers": ["Content-Range", "Accept-Ranges", "Content-Length"]
+        "expose_headers": ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition"]
     }
 })
 
 
+# ---------------------
+
+
 def extract_shortcode(url):
     """Extract shortcode from Instagram URL with query parameters"""
-    # Remove query parameters like ?igsh=...
     url = url.split('?')[0].rstrip('/')
 
     patterns = [
@@ -44,52 +47,42 @@ def extract_shortcode(url):
 
 def get_video_info_ytdlp(url):
     """
-    Get video info using yt-dlp
-    Optimized for mobile compatibility
+    Get video info using yt-dlp to find the direct stream URL.
     """
     try:
         print(f"\n{'=' * 70}")
         print(f"Fetching: {url}")
         print(f"{'=' * 70}")
 
-        # Clean URL - remove query parameters
         clean_url = url.split('?')[0]
 
-        # Mobile-friendly yt-dlp options
         ydl_opts = {
-            'quiet': False,
-            'no_warnings': False,
-            'extract_flat': False,
+            'quiet': True,  # Keep quiet for production logs
+            'no_warnings': True,
             'skip_download': True,
             'format': 'best[ext=mp4]/best',  # Prefer mp4 for mobile
             'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1',
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Sec-Fetch-Mode': 'navigate',
             }
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print("Extracting video info...")
             info = ydl.extract_info(clean_url, download=False)
 
             if not info:
-                print("✗ No info returned")
                 return None
 
-            # Find best video format for mobile
             video_url = None
             formats = info.get('formats', [])
 
-            # Prefer mp4 format for mobile compatibility
+            # Find best MP4 format
             for fmt in reversed(formats):
                 if fmt.get('ext') == 'mp4' and fmt.get('url'):
                     video_url = fmt['url']
                     break
 
-            # Fallback to any video URL
+            # Fallback
             if not video_url:
                 video_url = info.get('url')
 
@@ -98,17 +91,11 @@ def get_video_info_ytdlp(url):
                 return None
 
             print(f"✓ Video info extracted successfully")
-            print(f"  - Title: {info.get('title', 'Unknown')[:50]}")
-            print(f"  - Uploader: {info.get('uploader', 'Unknown')}")
-            print(f"  - Duration: {info.get('duration', 0)}s")
-            print(f"  - Format: {info.get('ext', 'unknown')}")
 
             return {
                 'video_url': video_url,
                 'username': info.get('uploader', 'Unknown'),
                 'caption': info.get('description', '')[:200] or info.get('title', ''),
-                'likes': info.get('like_count', 0),
-                'views': info.get('view_count', 0),
                 'thumbnail': info.get('thumbnail', ''),
                 'duration': info.get('duration', 0),
                 'title': info.get('title', 'Instagram Video'),
@@ -116,16 +103,7 @@ def get_video_info_ytdlp(url):
             }
 
     except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        print(f"✗ yt-dlp Error: {error_msg}")
-
-        if "Private" in error_msg or "login" in error_msg.lower():
-            print("  → Video is private or requires login")
-        elif "429" in error_msg:
-            print("  → Rate limited by Instagram")
-        elif "404" in error_msg:
-            print("  → Video not found or deleted")
-
+        print(f"✗ yt-dlp Error: {str(e)}")
         return None
     except Exception as e:
         print(f"✗ Unexpected Error: {str(e)}")
@@ -137,252 +115,126 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/api/download', methods=['POST', 'OPTIONS'])
-def download_reel():
-    """API endpoint to get video info"""
-    if request.method == 'OPTIONS':
-        response = jsonify({'status': 'ok'})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-        return response, 200
-
-    try:
-        data = request.get_json()
-
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-
-        url = data.get('url', '').strip()
-
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
-
-        if 'instagram.com' not in url:
-            return jsonify({'error': 'Please provide a valid Instagram URL'}), 400
-
-        shortcode = extract_shortcode(url)
-        if not shortcode:
-            return jsonify({'error': 'Invalid Instagram URL format'}), 400
-
-        print(f"\n🔄 Processing shortcode: {shortcode}")
-
-        # Get video info using yt-dlp
-        result = get_video_info_ytdlp(url)
-
-        if not result or not result.get('video_url'):
-            return jsonify({
-                'error': 'Could not fetch video. Possible reasons:\n\n' +
-                         '• Post is private\n' +
-                         '• Video was deleted\n' +
-                         '• Instagram rate limiting\n' +
-                         '• Invalid URL\n\n' +
-                         f'Shortcode: {shortcode}\n\n' +
-                         '💡 Try updating yt-dlp: pip install --upgrade yt-dlp'
-            }), 400
-
-        print(f"✓ Success! Video ready for download")
-
-        return jsonify({
-            'success': True,
-            'message': '✓ Video fetched successfully',
-            'video_url': result['video_url'],
-            'caption': result.get('caption', ''),
-            'likes': result.get('likes', 0),
-            'views': result.get('views', 0),
-            'owner': result.get('username', 'Unknown'),
-            'shortcode': shortcode,
-            'thumbnail': result.get('thumbnail', ''),
-            'duration': result.get('duration', 0),
-            'title': result.get('title', 'Instagram Video'),
-            'date': ''
-        })
-
-    except Exception as e:
-        print(f"✗ Server error: {str(e)}")
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
-
-
-@app.route('/api/download-video/<shortcode>', methods=['GET'])
-def download_video_file(shortcode):
-    """
-    Download video file - Optimized for mobile browsers
-    Supports Range requests for video streaming on mobile
-    """
-    try:
-        # Build Instagram URL
-        instagram_url = f"https://www.instagram.com/reel/{shortcode}/"
-
-        print(f"\n📥 Download request for: {shortcode}")
-        print(f"User-Agent: {request.headers.get('User-Agent', 'Unknown')}")
-
-        # Create temporary directory
-        temp_dir = tempfile.mkdtemp()
-        output_path = os.path.join(temp_dir, f'{shortcode}.mp4')
-
-        print(f"Downloading to: {output_path}")
-
-        # yt-dlp download options
-        ydl_opts = {
-            'outtmpl': output_path,
-            'format': 'best[ext=mp4]/best',
-            'quiet': False,
-            'no_warnings': False,
-            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15',
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([instagram_url])
-
-        if not os.path.exists(output_path):
-            print("✗ Download failed - file not found")
-            return jsonify({'error': 'Download failed'}), 400
-
-        file_size = os.path.getsize(output_path)
-        print(f"✓ Downloaded successfully ({file_size / 1024 / 1024:.2f} MB)")
-
-        filename = f"instagram_reel_{shortcode}.mp4"
-
-        # Handle Range requests for mobile video streaming
-        range_header = request.headers.get('Range', None)
-
-        if range_header:
-            # Mobile browser requesting specific byte range
-            print(f"📱 Mobile range request: {range_header}")
-
-            byte_start = 0
-            byte_end = file_size - 1
-
-            # Parse range header (e.g., "bytes=0-1023")
-            match = re.search(r'bytes=(\d+)-(\d*)', range_header)
-            if match:
-                byte_start = int(match.group(1))
-                if match.group(2):
-                    byte_end = int(match.group(2))
-
-            length = byte_end - byte_start + 1
-
-            def generate():
-                try:
-                    with open(output_path, 'rb') as f:
-                        f.seek(byte_start)
-                        remaining = length
-                        while remaining > 0:
-                            chunk_size = min(8192, remaining)
-                            chunk = f.read(chunk_size)
-                            if not chunk:
-                                break
-                            remaining -= len(chunk)
-                            yield chunk
-                finally:
-                    # Cleanup temp files
-                    try:
-                        os.remove(output_path)
-                        os.rmdir(temp_dir)
-                    except:
-                        pass
-
-            response = Response(
-                generate(),
-                206,  # Partial Content status for mobile
-                mimetype='video/mp4',
-                headers={
-                    'Content-Range': f'bytes {byte_start}-{byte_end}/{file_size}',
-                    'Accept-Ranges': 'bytes',
-                    'Content-Length': str(length),
-                    'Content-Disposition': f'attachment; filename="{filename}"',
-                    'Cache-Control': 'no-cache',
-                }
-            )
-
-        else:
-            # Standard download (non-range request)
-            print("💻 Standard download request")
-
-            def generate():
-                try:
-                    with open(output_path, 'rb') as f:
-                        while True:
-                            chunk = f.read(8192)
-                            if not chunk:
-                                break
-                            yield chunk
-                finally:
-                    # Cleanup
-                    try:
-                        os.remove(output_path)
-                        os.rmdir(temp_dir)
-                    except:
-                        pass
-
-            response = Response(
-                generate(),
-                mimetype='video/mp4',
-                headers={
-                    'Content-Disposition': f'attachment; filename="{filename}"',
-                    'Content-Length': str(file_size),
-                    'Accept-Ranges': 'bytes',
-                    'Cache-Control': 'no-cache',
-                }
-            )
-
-        return response
-
-    except Exception as e:
-        print(f"✗ Download error: {str(e)}")
-        # Cleanup on error
-        try:
-            if 'output_path' in locals() and os.path.exists(output_path):
-                os.remove(output_path)
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                os.rmdir(temp_dir)
-        except:
-            pass
-
-        return jsonify({'error': f'Download failed: {str(e)}'}), 500
-
-
 @app.route('/api/info', methods=['POST', 'OPTIONS'])
 def get_reel_info():
-    """Get video info without downloading"""
+    """Get video info without downloading - used for initial fetch"""
     if request.method == 'OPTIONS':
         return '', 204
 
     try:
         data = request.get_json()
-
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-
         url = data.get('url', '').strip()
 
-        if not url:
-            return jsonify({'error': 'URL is required'}), 400
+        if not url or 'instagram.com' not in url:
+            return jsonify({'error': 'Please provide a valid Instagram URL'}), 400
 
         result = get_video_info_ytdlp(url)
 
         if not result:
-            return jsonify({'error': 'Could not fetch video info'}), 400
+            return jsonify({'error': 'Could not fetch video info. Possible private post or rate limit.'}), 400
+
+        # NOTE: The client should now use the 'shortcode' to call the /api/stream-video route.
+        shortcode = extract_shortcode(url)
 
         return jsonify({
             'success': True,
-            'is_video': True,
-            'caption': result.get('caption', ''),
-            'likes': result.get('likes', 0),
-            'views': result.get('views', 0),
-            'comments': 0,
-            'date': '',
+            'message': '✓ Video fetched successfully',
+            'video_url': result['video_url'],  # This is a short-lived URL
             'owner_username': result.get('username', 'Unknown'),
-            'video_url': result['video_url'],
+            'shortcode': shortcode,
             'thumbnail': result.get('thumbnail', ''),
             'video_duration': result.get('duration', None),
-            'title': result.get('title', '')
+            'title': result.get('title', 'Instagram Video')
         })
 
     except Exception as e:
         print(f"✗ Info error: {str(e)}")
-        return jsonify({'error': f'Error: {str(e)}'}), 500
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
+
+@app.route('/api/stream-video/<shortcode>', methods=['GET'])
+def stream_video_file(shortcode):
+    """
+    🚀 FIXED: Streams the video file directly from the source URL.
+    This prevents server/browser timeouts (pending -> fails) on mobile devices
+    by immediately sending data chunks to the client.
+    """
+    instagram_url = f"https://www.instagram.com/reel/{shortcode}/"
+    filename = f"instagram_reel_{shortcode}.mp4"
+
+    try:
+        # 1. Get the direct, temporary video URL using yt-dlp
+        info = get_video_info_ytdlp(instagram_url)
+        if not info or not info.get('video_url'):
+            return jsonify({'error': 'Could not find video URL to stream.'}), 404
+
+        direct_video_url = info['video_url']
+
+        # 2. Start a streaming request to the direct video URL
+        # We pass the client's Range header to the source for proper streaming/resuming.
+        headers = {
+            'User-Agent': request.headers.get('User-Agent',
+                                              'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15'),
+            'Range': request.headers.get('Range', '')  # Crucial for mobile Range requests
+        }
+
+        # Set a reasonable timeout for the total stream connection
+        r = requests.get(direct_video_url, headers=headers, stream=True, timeout=300)
+
+        # Check for 200 (full content) or 206 (partial content)
+        if r.status_code not in (200, 206):
+            print(f"✗ Failed to get direct video stream. Status: {r.status_code}")
+            return jsonify({'error': f'Failed to stream video from source. Status: {r.status_code}'}), 500
+
+        # 3. Generator to yield chunks of the stream
+        def generate_stream():
+            try:
+                # Use iter_content to read data in chunks
+                for chunk in r.iter_content(chunk_size=8192):
+                    yield chunk
+            except Exception as e:
+                # Log streaming error but let the stream close
+                print(f"Streaming inner error: {e}")
+            finally:
+                # Ensure connection is closed
+                r.close()
+
+        # 4. Construct the Final Response
+        response_headers = {
+            # Forces the browser to download
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            # Pass through critical streaming headers from the video source
+            'Accept-Ranges': r.headers.get('Accept-Ranges', 'bytes'),
+            'Content-Length': r.headers.get('Content-Length'),
+            'Content-Range': r.headers.get('Content-Range'),  # Only present for 206 status
+            # Important caching headers for mobile
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+        }
+
+        # Use the status code from the source (200 or 206)
+        response = Response(
+            stream_with_context(generate_stream()),
+            status=r.status_code,
+            mimetype='video/mp4',
+            headers=response_headers
+        )
+
+        return response
+
+    except Exception as e:
+        print(f"✗ Streaming Error: {str(e)}")
+        # This occurs if requests.get() fails (e.g., DNS, initial timeout)
+        return jsonify({'error': f'Download/Streaming failed: {str(e)}'}), 500
+
+
+# --- Removed the OLD, BLOCKING download_video_file route ---
+# It was removed because the blocking I/O caused the mobile timeout issue.
+# The new route is: /api/stream-video/<shortcode>
+
+
+# --- HEALTH AND TEST ROUTES (Kept for completeness) ---
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -394,7 +246,6 @@ def health_check():
             'status': '✓ healthy',
             'method': 'yt-dlp (FREE)',
             'yt_dlp_version': version,
-            'requires_api_key': False,
             'mobile_optimized': True,
             'supports_range_requests': True
         })
@@ -407,13 +258,12 @@ def health_check():
 
 @app.route('/test', methods=['GET'])
 def test_download():
-    """Test with the exact URL you provided"""
+    """Test with a sample URL"""
     try:
-        # Your exact test URL
-        test_url = "https://www.instagram.com/reel/DPB75Z9DGjb/?igsh=cG8zeXR2azlxa3By"
+        test_url = "https://www.instagram.com/reel/DPB75Z9DGjb/"  # Sample reel
 
         print(f"\n{'=' * 70}")
-        print(f"🧪 TESTING WITH YOUR URL")
+        print(f"🧪 TESTING")
         print(f"{'=' * 70}")
 
         result = get_video_info_ytdlp(test_url)
@@ -421,15 +271,12 @@ def test_download():
         if result:
             return jsonify({
                 'status': '✓ SUCCESS',
-                'message': 'yt-dlp is working perfectly!',
+                'message': 'yt-dlp is working and retrieved a direct URL for streaming.',
                 'test_url': test_url,
-                'shortcode': 'DPB75Z9DGjb',
                 'video_found': True,
                 'video_info': {
                     'title': result.get('title', ''),
-                    'username': result.get('username', ''),
                     'duration': result.get('duration', 0),
-                    'likes': result.get('likes', 0),
                     'has_video_url': bool(result.get('video_url'))
                 },
                 'mobile_compatible': True
@@ -437,42 +284,22 @@ def test_download():
         else:
             return jsonify({
                 'status': '✗ FAILED',
-                'message': 'Could not fetch video',
-                'test_url': test_url,
-                'possible_reasons': [
-                    'Video is private',
-                    'Instagram blocked request',
-                    'yt-dlp needs update'
-                ]
+                'message': 'Could not fetch video info for test URL (it might be private or deleted).',
             }), 400
 
     except Exception as e:
         return jsonify({
             'status': '✗ ERROR',
             'error': str(e),
-            'test_url': test_url
         }), 500
 
 
 if __name__ == '__main__':
     print(f"\n{'=' * 70}")
-    print(f"🚀 Flask Instagram Downloader - Mobile Optimized")
+    print(f"🚀 Flask Instagram Downloader - FIXED & STREAMING")
     print(f"{'=' * 70}")
-    print(f"✓ Using yt-dlp (FREE - No API keys required)")
-    print(f"✓ Mobile-friendly video streaming (Range requests)")
-    print(f"✓ Works on iOS Safari, Android Chrome, Desktop browsers")
-    print(f"{'=' * 70}\n")
-
-    # Check yt-dlp
-    try:
-        import yt_dlp
-
-        print(f"✓ yt-dlp version: {yt_dlp.version.__version__}")
-    except ImportError:
-        print("✗ yt-dlp not installed!")
-        print("  Run: pip install yt-dlp")
-
-    print(f"\n📱 Test endpoint: http://localhost:5000/test")
-    print(f"❤️  Health check: http://localhost:5000/health\n")
+    print(f"✓ Fixed mobile 'pending' issue by switching to **direct streaming**.")
+    print(f"✓ New stream endpoint: /api/stream-video/<shortcode>")
+    print(f"✓ Health check: http://localhost:5000/health\n")
 
     app.run(debug=True, host='0.0.0.0', port=5000)

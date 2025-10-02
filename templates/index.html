@@ -4,8 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Instagram Reels Downloader</title>
-    <link href="{{ url_for('static', filename='css/output.css') }}" rel="stylesheet">
+    <!-- Use Tailwind CDN for self-contained file -->
+    <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <!-- Configure default font and transition -->
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
 </head>
 <body class="bg-gradient-to-br from-purple-400 via-pink-500 to-red-500 min-h-screen">
 
@@ -40,14 +45,17 @@
                 <!-- Buttons -->
                 <div class="flex flex-col sm:flex-row gap-3 mb-6">
                     <button
+                        id="infoBtn"
                         onclick="fetchReelInfo()"
                         class="flex-1 bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold py-3 md:py-4 rounded-xl hover:from-blue-600 hover:to-blue-700 transition-all transform hover:scale-105 shadow-lg"
                     >
                         📊 Get Info
                     </button>
                     <button
+                        id="downloadBtn"
                         onclick="downloadReel()"
-                        class="flex-1 bg-gradient-to-r from-pink-500 to-red-500 text-white font-semibold py-3 md:py-4 rounded-xl hover:from-pink-600 hover:to-red-600 transition-all transform hover:scale-105 shadow-lg"
+                        disabled
+                        class="flex-1 bg-gradient-to-r from-gray-400 to-gray-500 text-white font-semibold py-3 md:py-4 rounded-xl cursor-not-allowed shadow-lg"
                     >
                         ⬇️ Download
                     </button>
@@ -102,6 +110,151 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+    <script>
+        // State to hold the shortcode once fetched
+        let currentShortcode = null;
+
+        // --- DOM Elements ---
+        const urlInput = document.getElementById('reelUrl');
+        const infoBtn = document.getElementById('infoBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const loadingDiv = document.getElementById('loading');
+        const resultDiv = document.getElementById('result');
+        const errorDiv = document.getElementById('error');
+        const errorMessage = document.getElementById('errorMessage');
+        const resultContent = document.getElementById('resultContent');
+
+        // --- Utility Functions (Based on user's structure) ---
+        function showLoading() {
+            loadingDiv.classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            loadingDiv.classList.add('hidden');
+        }
+
+        function showResult() {
+            resultDiv.classList.remove('hidden');
+        }
+
+        function hideResult() {
+            resultDiv.classList.add('hidden');
+        }
+
+        function showError(message) {
+            errorMessage.textContent = message;
+            errorDiv.classList.remove('hidden');
+        }
+
+        function hideError() {
+            errorDiv.classList.add('hidden');
+        }
+
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+
+        function clearMessages() {
+            hideResult();
+            hideError();
+            setDownloadButtonState(false);
+            currentShortcode = null;
+        }
+
+        function setDownloadButtonState(isEnabled) {
+            downloadBtn.disabled = !isEnabled;
+            if (isEnabled) {
+                downloadBtn.classList.remove('bg-gradient-to-r', 'from-gray-400', 'to-gray-500', 'cursor-not-allowed');
+                downloadBtn.classList.add('from-pink-500', 'to-red-500', 'hover:from-pink-600', 'hover:to-red-600', 'cursor-pointer');
+            } else {
+                downloadBtn.classList.add('bg-gradient-to-r', 'from-gray-400', 'to-gray-500', 'cursor-not-allowed');
+                downloadBtn.classList.remove('from-pink-500', 'to-red-500', 'hover:from-pink-600', 'hover:to-red-600', 'cursor-pointer');
+            }
+        }
+
+        // --- Core Application Logic ---
+
+        function displayReelInfo(data) {
+            resultContent.innerHTML = `
+                <p><span class="font-semibold text-gray-700">Title:</span> ${data.title || 'N/A'}</p>
+                <p><span class="font-semibold text-gray-700">Uploader:</span> @${data.owner_username || 'Unknown'}</p>
+                <p><span class="font-semibold text-gray-700">Duration:</span> ${data.video_duration ? `${data.video_duration} seconds` : 'N/A'}</p>
+                <p><span class="font-semibold text-gray-700">Shortcode:</span> ${data.shortcode}</p>
+                <p class="mt-2 text-sm text-gray-600">Ready to download. Click the red button above!</p>
+            `;
+            showResult();
+            setDownloadButtonState(true);
+        }
+
+        async function fetchReelInfo() {
+            clearMessages();
+            const url = urlInput.value.trim();
+
+            if (!url) {
+                showError('Please enter a valid Instagram URL');
+                return;
+            }
+
+            setDownloadButtonState(false);
+            infoBtn.disabled = true;
+            showLoading();
+
+            try {
+                const response = await axios.post('/api/info', { url });
+
+                if (response.data.success) {
+                    currentShortcode = response.data.shortcode; // Store the shortcode
+                    displayReelInfo(response.data);
+                }
+            } catch (error) {
+                console.error("Fetch Info Error:", error);
+                showError(error.response?.data?.error || 'Failed to fetch reel information. Check the URL or if the post is private.');
+                setDownloadButtonState(false);
+            } finally {
+                hideLoading();
+                infoBtn.disabled = false;
+            }
+        }
+
+
+        function downloadReel() {
+            if (!currentShortcode) {
+                showError("Please click 'Get Info' first to load the video metadata.");
+                return;
+            }
+
+            // ⭐ THE CRITICAL FIX: Direct link to the streaming endpoint!
+            // This prevents the mobile browser timeout by starting the data flow immediately.
+            const downloadUrl = `/api/stream-video/${currentShortcode}`;
+
+            // Initiate the download by redirecting the browser.
+            window.location.href = downloadUrl;
+
+            // Give visual feedback that the download has been initiated
+            // Remove any previous download messages
+            document.querySelectorAll('#downloadMessage').forEach(el => el.remove());
+
+            resultContent.insertAdjacentHTML('beforeend', `
+                <div id="downloadMessage" class="mt-4 p-3 bg-yellow-100 text-yellow-800 rounded-lg text-center font-semibold animate-pulse">
+                    ⬇️ Download initiated! Check your notifications/downloads folder.
+                </div>
+            `);
+            // Clear the message after a short period
+            setTimeout(() => {
+                const msg = document.getElementById('downloadMessage');
+                if (msg) msg.remove();
+            }, 5000);
+        }
+
+        // Initial state setup
+        window.onload = clearMessages;
+    </script>
 </body>
 </html>
